@@ -10258,6 +10258,83 @@ func TestJetStreamClusterStreamInfoWithInflightStreamUpdate(t *testing.T) {
 	require_Equal(t, si.State.Consumers, consumers)
 }
 
+func TestJetStreamClusterConsumerInfoWithUncommittedCreate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	ml := c.leader()
+	nc, js := jsClientConnect(t, ml)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "TEST", Subjects: []string{"foo"}, Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
+	// Shutdown all servers, except for the metadata leader.
+	for _, s := range c.servers {
+		if s != ml {
+			s.Shutdown()
+		}
+	}
+	sjs, _ := ml.getJetStreamCluster()
+
+	// Use R1 so the consumer can be placed on the metadata.
+	// Its assignment still needs a quorum of the three metadata peers.
+	cfg := &nats.ConsumerConfig{
+		Durable: "C", Name: "C", FilterSubject: "foo", AckPolicy: nats.AckExplicitPolicy, Replicas: 1,
+	}
+	_, err = js.AddConsumer("TEST", cfg, nats.MaxWait(250*time.Millisecond))
+	require_Error(t, err, context.DeadlineExceeded)
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		sjs.mu.RLock()
+		applied := sjs.consumerAssignment(globalAccountName, "TEST", "C")
+		pending := sjs.consumerAssignmentOrInflight(globalAccountName, "TEST", "C")
+		sjs.mu.RUnlock()
+		if applied != nil || pending == nil {
+			return fmt.Errorf("expected only an inflight assignment: applied=%v pending=%v",
+				applied != nil, pending != nil)
+		}
+		return nil
+	})
+
+	if ci, err := js.ConsumerInfo("TEST", "C", nats.MaxWait(250*time.Millisecond)); err == nil {
+		t.Errorf("ConsumerInfo succeeded for an uncommitted creation: name=%q cluster=%+v", ci.Name, ci.Cluster)
+	}
+
+	// The legacy client retries consumer creation by first checking ConsumerInfo.
+	// Make sure this fails as well.
+	if ci, err := js.AddConsumer("TEST", cfg, nats.MaxWait(250*time.Millisecond)); err == nil {
+		t.Errorf("AddConsumer retry succeeded for an uncommitted creation: name=%q cluster=%+v", ci.Name, ci.Cluster)
+	}
+
+	// Restart servers and check that the consumer works.
+	for _, s := range c.servers {
+		if s != ml {
+			c.restartServer(s)
+		}
+	}
+	c.waitOnLeader()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+	ci, err := js.ConsumerInfo("TEST", "C")
+	require_NoError(t, err)
+	require_Equal(t, ci.Name, "C")
+	sub, err := js.PullSubscribe("foo", "C", nats.Bind("TEST", "C"))
+	require_NoError(t, err)
+	ack, err := js.Publish("foo", []byte("message after committed creation"))
+	require_NoError(t, err)
+	msgs, err := sub.Fetch(1, nats.MaxWait(5*time.Second))
+	require_NoError(t, err)
+	require_Equal(t, len(msgs), 1)
+	meta, err := msgs[0].Metadata()
+	require_NoError(t, err)
+	require_Equal(t, meta.Sequence.Stream, ack.Sequence)
+	require_NoError(t, msgs[0].AckSync())
+}
+
 func TestJetStreamClusterConsumerInfoWithInflightConsumerDelete(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
